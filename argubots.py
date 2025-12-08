@@ -189,4 +189,232 @@ class AkikiAgent(Agent):
         log.info(f"[cyan]Built query from {len(query_parts)} weighted parts[/cyan]")
         return result
         
-akiki = KialoAgent("Akiki", Kialo(glob.glob("data/*.txt")))   # get the Kialo database from text files
+akiki = AkikiAgent(
+    name="Akiki",
+    kialo=Kialo(glob.glob("data/*.txt")),
+    context_weight=2.0
+)
+
+class RAGAgent(LLMAgent):
+    """
+    Aragorn: Retrieval-Augmented Generation agent.
+    Combines:
+      - LLM (like Alice) for paraphrasing + final response
+      - Kialo retrieval (like Akiki) for structured arguments
+    """
+
+    def __init__(self, name: str, client, model: str, kialo: Kialo,
+                **kwargs_llm):
+        super().__init__(name=name, client=client, model=model,
+                          **kwargs_llm)
+        self.kialo = kialo
+
+    # Step 1:  Ask the LLM what claim should be responded to. 
+    def _paraphrase_last_turn_as_claim(self, d: Dialogue) -> str:
+        """
+        Ask the LLM: given this whole dialogue, what is the human's
+        last turn really *claiming* or *implying*?
+        Return a single explicit sentence or short paragraph.
+        """
+        dialogue_text = d.script()
+        previous_turn = d[-1]['content'].strip()  # previous turn from user
+
+        system_msg = (
+            "You are an argument analyst. I gave this whole dialogue to you, you must rewrite "
+            "the human's LAST TURN as an explicit claim.\n"
+            "Your answer should:\n"
+            "  - Your paraphrase should makes an explicit claim and can be better understood without the context\n"
+            "  - Your answer show with a much longer statement with many more word types.\n"
+            "Return ONLY the rewritten claim."
+        )
+
+        user_msg = (
+            "Here is the dialogue:\n"
+            "-------------------------------\n"
+            f"{dialogue_text}\n"
+            "-------------------------------\n\n"
+            f"The human's last turn was:\n\"{previous_turn}\"\n\n"
+            "Please rewrite that last human turn as an explicit claim:"
+        )
+
+        messages = [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_msg},
+        ]
+
+        resp = self.client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            **self.kwargs_llm,
+        )
+
+        paraphrased = resp.choices[0].message.content.strip()
+        log.info(f"[green]Paraphrased human claim: {paraphrased}[/green]")
+        return paraphrased
+
+    def _kialo_document(self, llm_claim: str, n_neighbors: int = 3) -> str:
+        """
+        Look up claims in Kialo that are similar to the explicit
+        claim.  Create a short "document" that describes some of those claims and
+        their neighbors on Kialo.
+        """
+        neighbors = self.kialo.closest_claims(llm_claim, n=n_neighbors, kind="has_cons")
+        assert neighbors, "No claims to choose from; is Kialo data structure empty?"
+
+        lines = []
+        lines.append("Below are some possibly related claims and arguments from the Kialo debate website.\n")
+
+        for i, c in enumerate(neighbors, start=1):
+            lines.append(f"Claim {i}: \"{c}\"")
+
+            if self.kialo.pros[c]:
+                lines.append("Some arguments from other Kialo users in favor of that claim::")
+                for pro in self.kialo.pros[c]:
+                    lines.append(f"    * {pro}")
+
+            if self.kialo.cons[c]:
+                lines.append("Some arguments from other Kialo users against that claim::")
+                for con in self.kialo.cons[c]:
+                    lines.append(f"    * {con}")
+
+            lines.append("") 
+
+        doc = "\n".join(lines).strip()
+        log.info(f"[cyan]Built Kialo document:\n{doc[:300]}...[/cyan]")
+        return doc
+
+    def response(self, d: Dialogue, **kwargs) -> str:
+        """
+          1. Query formation step: LLM paraphrases human's last turn as a claim.
+          2. Retrieval step: Retrieve Kialo arguments about that claim.
+          3. Retrieval-augmented generation
+        """
+        if len(d) == 0: # no previous turns 
+            return super().response(d, **kwargs)
+
+        # step 1: Paraphrase last turn as explicit claim from LLM 
+        explicit_claim = self._paraphrase_last_turn_as_claim(d)
+
+        # 2. Retrieve related Kialo content
+        kialo_doc = self._kialo_document(explicit_claim)
+
+        # 3. Build final prompt for the response
+        dialogue_text = d.script()
+
+        system_msg = (
+            "You are Aragorn, a thoughtful conversational agent. "
+            "Respond directly to the human's viewpoint. "
+            "You may use the evidence provided, but do not mention any retrieval process "
+            "or where the arguments came from. Keep your word polite and reasoned."
+        )
+
+        user_msg = (
+            "Here is the current dialogue:\n"
+            f"{dialogue_text}\n\n"
+            "Here is an explicit paraphrase of the human's last claim:\n"
+            f"{explicit_claim}\n\n"
+            "Here are some related pros and cons claims and arguments from the Kialo Database:\n"
+            f"{kialo_doc}\n\n"
+            "Now please write your next turn in the dialogue, responding to the human's last claim.\n"
+            " Write in 2-4 sentences."
+        )
+
+        messages = [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_msg},
+        ]
+
+        resp = self.client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            **(self.kwargs_llm | kwargs),
+        )
+
+        reply = resp.choices[0].message.content.strip()
+        log.info(f"[magenta]Aragorn's response:\n{reply}[/magenta]")
+        return reply
+
+aragorn = RAGAgent(
+    name="Aragorn",
+    client=None, 
+    model="gpt-4o-mini", 
+    kialo=Kialo(glob.glob("data/*.txt")),
+    temperature=0.7,
+    max_tokens=500,
+)
+
+class Awsom(RAGAgent):
+    """
+    Awsom = Aragorn (RAG) + CoT planning
+    """
+
+    def _cot_plan_and_answer(self, d: Dialogue, explicit_claim: str, kialo_doc: str) -> str:
+        dialogue_text = d.script()
+
+        user_prompt = (
+            "You are Awsom, an argubot trying to broaden the human's mind.\n\n"
+            "Here is the dialogue so far:\n"
+            f"{dialogue_text}\n\n"
+            "From this, you have inferred that the human's last turn claim is:\n"
+            f"  \"{explicit_claim}\"\n\n"
+            "You also know some related pros and cons claims and arguments from the Kialo Database::\n"
+            f"{kialo_doc}\n\n"
+            "Now let's do and think some open questions:\n"
+            "1. Think as 'Awsom (private thought)', and try to analyze the human's ideas, motivations, "
+            ", personality. What are their intention and how best to respond to help the human express? Plan a way "
+            "to open their mind while staying respectful. \n"
+            "2. Then, as 'Awsom', speak ONE short reply (1-2 sentences) that responds "
+            "to the human and gently challenges or broadens their view.\n\n"
+            "Format your output EXACTLY like this:\n"
+            "Awsom (private thought): <your analyze and plan>\n"
+            "Awsom: <your final reponse>\n"
+        )
+
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are Awsom. You need to think privately before you reply to the human. "
+                    "Your private thoughts are labeled 'Awsom (private thought)'. "
+                    "The line starting with 'Awsom (to <human>):' is the final response to the human."
+                ),
+            },
+            {"role": "user", "content": user_prompt},
+        ]
+
+        resp = self.client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            **self.kwargs_llm,
+        )
+
+        full_text = resp.choices[0].message.content.strip()
+        log.info(f"[cyan]Awsom CoT output:\n{full_text}[/cyan]")
+
+        import re
+        m = re.search(r"Awsom:\s*(.*)", full_text, re.DOTALL)
+        if m:
+            answer = m.group(1).strip()
+            return answer
+        else:
+            return full_text
+
+    def response(self, d: Dialogue, **kwargs) -> str:
+        if len(d) == 0:
+            return super(LLMAgent, self).response(d, **kwargs)  # or define a custom opener
+
+        # same as RAG 
+        explicit_claim = self._paraphrase_last_turn_as_claim(d)
+        kialo_doc = self._kialo_document(explicit_claim)
+
+        # with COT 
+        return self._cot_plan_and_answer(d, explicit_claim, kialo_doc)
+    
+awsom = Awsom(
+    name="Awsom",
+    client=None,
+    model="gpt-4o-mini",
+    kialo=Kialo(glob.glob("data/*.txt")),
+    temperature=0.7,
+    max_tokens=500,
+)
