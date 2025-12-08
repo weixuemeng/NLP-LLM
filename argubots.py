@@ -345,7 +345,7 @@ aragorn = RAGAgent(
 
 class Awsom(RAGAgent):
     """
-    Awsom = Aragorn (RAG) + CoT planning
+    Awsom = Aragorn (RAG) and CoT planning
     """
 
     def _cot_plan_and_answer(self, d: Dialogue, explicit_claim: str, kialo_doc: str) -> str:
